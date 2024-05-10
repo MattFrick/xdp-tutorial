@@ -62,7 +62,7 @@ static __always_inline int parse_ethhdr(struct hdr_cursor *nh, void *data_end,
 	/* Use loop unrolling to avoid the verifier restriction on loops;
 	 * support up to VLAN_MAX_DEPTH layers of VLAN encapsulation.
 	 */
-	#pragma unroll
+	//#pragma unroll
 	for (i = 0; i < VLAN_MAX_DEPTH; i++) {
 		if (!proto_is_vlan(h_proto))
 			break;
