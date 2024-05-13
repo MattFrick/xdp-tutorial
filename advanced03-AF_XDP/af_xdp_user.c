@@ -12,6 +12,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include <sys/resource.h>
 
@@ -23,8 +24,10 @@
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
+#include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
+#include <linux/udp.h>
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -69,6 +72,15 @@ struct xsk_socket_info {
 	struct stats_record stats;
 	struct stats_record prev_stats;
 };
+
+struct tx_packet_info {
+	uint16_t len;
+};
+
+struct tx_packet_info tx_len[XSK_RING_CONS__DEFAULT_NUM_DESCS];
+
+static bool process_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len, bool is_initial_rx);
+
 
 static inline __u32 xsk_ring_prod__free(struct xsk_ring_prod *r)
 {
@@ -247,14 +259,33 @@ static void complete_tx(struct xsk_socket_info *xsk)
 					&idx_cq);
 
 	if (completed > 0) {
-		for (int i = 0; i < completed; i++)
+#if 1
+        for (int i = 0; i < completed; i++)
 			xsk_free_umem_frame(xsk,
-					    *xsk_ring_cons__comp_addr(&xsk->umem->cq,
-								      idx_cq++));
-
+				*xsk_ring_cons__comp_addr(&xsk->umem->cq,
+										  idx_cq++));
+#else
+		int newly_sent = 0;
+		for (int i = 0; i < completed; i++) {
+			uint64_t addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++);
+			uint32_t len = 1512;	// HACK: using max length.  We already validated headers are inside packet.
+										// TODO: Need a shadow array to store len when we add to TX queue
+			//printf("Processing trasmitted packet, addr=%" PRIx64 "\n", addr);
+			if (!process_packet(xsk, addr, len, false)) {
+				//printf("Freeing transmitted packet\n");
+				xsk_free_umem_frame(xsk, addr);
+			} else {
+				newly_sent++;
+			}
+		}
+		if (newly_sent > 0) {
+			sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+		}
+#endif
 		xsk_ring_cons__release(&xsk->umem->cq, completed);
 		xsk->outstanding_tx -= completed < xsk->outstanding_tx ?
 			completed : xsk->outstanding_tx;
+		//printf("Done reclaiming transmited packets, xsk->outstanding_tx=%u\n", xsk->outstanding_tx);
 	}
 }
 
@@ -276,11 +307,119 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
+bool transmit_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
+{
+	uint32_t tx_idx = 0;
+	if (xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx) != 1) {
+		/* No more transmit slots, drop the packet */
+		return false;
+	}
+
+	xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+	xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
+	xsk_ring_prod__submit(&xsk->tx, 1);
+	xsk->outstanding_tx++;
+
+	xsk->stats.tx_bytes += len;
+	xsk->stats.tx_packets++;
+	return true;
+}
+
+static void duplicate_and_process_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
+{
+	uint64_t frame = xsk_alloc_umem_frame(xsk);
+	if (frame == INVALID_UMEM_FRAME) {
+		return;
+	}
+	uint8_t *orig_data = xsk_umem__get_data(xsk->umem->buffer, addr);
+	uint8_t *new_data = xsk_umem__get_data(xsk->umem->buffer, frame);
+	memcpy(new_data, orig_data, len);
+	if (!process_packet(xsk, frame, len, false)) {
+		xsk_free_umem_frame(xsk, frame);
+		return;
+	} // else: Packet was transmitted inside process_packet.
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
-			   uint64_t addr, uint32_t len)
+			   uint64_t addr, uint32_t len, bool is_initial_rx)
 {
 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+	struct ethhdr *eth = (struct ethhdr *) pkt;
+	struct iphdr *ip = (struct iphdr *) (eth + 1);
+	struct udphdr *udp = (struct udphdr*) (ip + 1);
+#define UPPER_PORT 8011
+#define LOWER_PORT 8007
 
+	if (ntohs(eth->h_proto) != ETH_P_IP ||
+		len < (sizeof(*eth) + sizeof(*ip) + sizeof(*udp)) ||
+		ntohs(udp->dest) > UPPER_PORT || ntohs(udp->dest) < LOWER_PORT)
+	{
+		return false;
+	}
+//	printf("process_packet() handling ip.id=%hu, addr=%" PRIx64 "\n", ip->id, addr);
+	if (is_initial_rx) {
+		// Swap MAC addresses, to send right back
+		uint8_t tmp_mac[ETH_ALEN];
+		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+	}
+
+	uint32_t csum;
+#define SIMPLE_SWAP 0
+#if SIMPLE_SWAP
+	// Simple swap of ip src/dst, should not need checksum adjustment.
+	in_addr_t temp = ip->saddr;	// network byte order, do not care
+	ip->saddr = ip->daddr;
+	ip->daddr = temp;
+#else
+	in_addr_t new_ip = 0xc0a80038;	// 192.168.0.56
+	in_addr_t old_ip = ntohl(ip->daddr);
+	if (is_initial_rx) {
+		// Replace IP address
+		ip->daddr = htonl(new_ip);
+		// Fix the checksum in IP header
+		csum = ~ntohs(ip->check);
+		csum -= old_ip;
+		csum += new_ip;
+		csum = (csum & 0xffff) + (csum >> 16);
+		csum = (csum & 0xffff) + (csum >> 16);
+		ip->check = ~htons(csum);
+	}
+#endif
+
+
+	// Fix the checksum in UDP header
+	csum = ~ntohs(udp->check);
+//	printf("portIn = %d\n", ntohs(udp->dest));
+#if !SIMPLE_SWAP
+	if (is_initial_rx) {
+		csum -= old_ip;
+		csum += new_ip;
+	}
+#endif
+#if 1 // Increment port
+	uint16_t old_port = ntohs(udp->dest);
+	uint16_t new_port = (old_port + 1) & 0xFFFF;
+	csum -= old_port;
+	csum += new_port;
+	udp->dest = htons(new_port);
+#endif
+	csum = (csum & 0xffff) + (csum >> 16);
+	csum = (csum & 0xffff) + (csum >> 16);
+	udp->check = ~htons(csum);
+//	printf("portOut= %d\n", ntohs(udp->dest));
+
+	duplicate_and_process_packet(xsk, addr, len);
+	/* Here we sent the packet out of the receive port. Note that
+		* we allocate one entry and schedule it. Your design would be
+		* faster if you do batch processing/transmission */
+
+
+	bool ret = transmit_packet(xsk, addr, len);
+	//complete_tx(xsk);
+	return ret;
+#if 0 // MSF: Original function:
     /* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
 	 *
 	 * Some assumptions to make it easier:
@@ -338,8 +477,8 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		xsk->stats.tx_packets++;
 		return true;
 	}
-
 	return false;
+#endif
 }
 
 static void handle_receive_packets(struct xsk_socket_info *xsk)
@@ -378,17 +517,16 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 		uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
 		uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
 
-		if (!process_packet(xsk, addr, len))
+		if (!process_packet(xsk, addr, len, true)) {
+			//printf("Releasing packet\n");
 			xsk_free_umem_frame(xsk, addr);
+		}
 
 		xsk->stats.rx_bytes += len;
 	}
 
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	xsk->stats.rx_packets += rcvd;
-
-	/* Do we need to wake up the kernel for transmission */
-	complete_tx(xsk);
   }
 
 static void rx_and_process(struct config *cfg,
@@ -402,12 +540,16 @@ static void rx_and_process(struct config *cfg,
 	fds[0].events = POLLIN;
 
 	while(!global_exit) {
+//		usleep(10);
+		//if (cfg->xsk_poll_mode && !xsk_socket->outstanding_tx) { // MSF
 		if (cfg->xsk_poll_mode) {
 			ret = poll(fds, nfds, -1);
 			if (ret <= 0 || ret > 1)
 				continue;
 		}
 		handle_receive_packets(xsk_socket);
+		/* Do we need to wake up the kernel for transmission */
+		complete_tx(xsk_socket);
 	}
 }
 
