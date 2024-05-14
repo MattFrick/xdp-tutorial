@@ -34,6 +34,7 @@
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
 
+// Doubling frame count to ensure we have a frame if we have a descriptor
 #define FRAME_SCALE_FACTOR 2
 #define TX_RING_SCALE_FACTOR 1
 #define BATCH_SCALE_FACTOR 1
@@ -81,8 +82,7 @@ struct xsk_socket_info {
 	struct stats_record prev_stats;
 };
 
-static bool process_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len, bool is_initial_rx);
-
+// Ad hoc stats
 uint64_t total_completed = 0;
 uint64_t dropped_no_slots = 0;
 uint64_t total_needed = 0;
@@ -90,6 +90,7 @@ uint64_t total_allocs = 0;
 uint64_t last_batch_size = 0;
 uint64_t max_batch_size = 0;
 uint64_t max_completed = 0;
+uint64_t last_completed = 0;
 uint64_t recycle_retries = 0;
 uint64_t extra_tx_kick = 0;
 
@@ -254,61 +255,30 @@ error_exit:
 	return NULL;
 }
 
-static void complete_tx(struct xsk_socket_info *xsk)
+static void recycle_tx_completion(struct xsk_socket_info *xsk)
 {
 	unsigned int completed;
 	uint32_t idx_cq;
 
-#if 0
-	if (!xsk->outstanding_tx) {
-	//	printf("No outstanding\n");
-		return;
-	}
-#endif
-#if 0 // Moved to where we submit descriptors
-	if (xsk_ring_prod__needs_wakeup(&xsk->tx)) {
-		printf("Sendto");
-		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-	}
-#endif
 	/* Collect/free completed TX buffers */
 	completed = xsk_ring_cons__peek(&xsk->umem->cq,
 					XSK_RING_CONS__DEFAULT_NUM_DESCS,
 					&idx_cq);
 
 	if (completed > 0) {
-#if 1
         for (int i = 0; i < completed; i++) {
 			xsk_free_umem_frame(xsk,
 				*xsk_ring_cons__comp_addr(&xsk->umem->cq,
 										  idx_cq++));
 		}
 		total_completed += completed;
+		last_completed = completed;
 		if (max_completed < completed) {
 			max_completed = completed;
 		}
-#else
-		int newly_sent = 0;
-		for (int i = 0; i < completed; i++) {
-			uint64_t addr = *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++);
-			uint32_t len = 1512;	// HACK: using max length.  We already validated headers are inside packet.
-										// TODO: Need a shadow array to store len when we add to TX queue
-			//printf("Processing trasmitted packet, addr=%" PRIx64 "\n", addr);
-			if (!process_packet(xsk, addr, len, false)) {
-				//printf("Freeing transmitted packet\n");
-				xsk_free_umem_frame(xsk, addr);
-			} else {
-				newly_sent++;
-			}
-		}
-		if (newly_sent > 0) {
-			sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-		}
-#endif
 		xsk_ring_cons__release(&xsk->umem->cq, completed);
 		xsk->outstanding_tx -= completed < xsk->outstanding_tx ?
 			completed : xsk->outstanding_tx;
-		//printf("Done reclaiming transmited packets, xsk->outstanding_tx=%u\n", xsk->outstanding_tx);
 	}
 }
 
@@ -346,21 +316,6 @@ bool transmit_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
 	xsk->stats.tx_bytes += len;
 	xsk->stats.tx_packets++;
 	return true;
-}
-
-static void duplicate_and_process_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
-{
-	uint64_t frame = xsk_alloc_umem_frame(xsk);
-	if (frame == INVALID_UMEM_FRAME) {
-		return;
-	}
-	uint8_t *orig_data = xsk_umem__get_data(xsk->umem->buffer, addr);
-	uint8_t *new_data = xsk_umem__get_data(xsk->umem->buffer, frame);
-	memcpy(new_data, orig_data, len);
-	if (!process_packet(xsk, frame, len, false)) {
-		xsk_free_umem_frame(xsk, frame);
-		return;
-	} // else: Packet was transmitted inside process_packet.
 }
 
 typedef struct mcopy {
@@ -415,37 +370,56 @@ static void replace_ip_addr_and_port(struct iphdr *ip, struct udphdr *udp, in_ad
 
 static bool multicopy_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
 {
+#define HANDLE_RETRIES 1
+#if HANDLE_RETRIES
+	// TODO: The retries is ridiculously large.  Need to investigate why that without this,
+	// there are lots of dropped-no-slots every ~2-8 seconds.
 	unsigned int retries_remaining = 10000;
 
 retry_reserve:
-	// First, see if there are enough tx descriptors to make all copies
-	unsigned int needed = xsk_prod_nb_free(&xsk->tx, TX_RING_SIZE / 4);
-	//printf("needed: %d", needed);
-	if (needed < (TX_RING_SIZE / 8)) {
+#endif
+	// First, see if there are enough tx descriptors to make all copies.
+	// Asking for larger number of buffers reloads cached value using atomics.
+	// TODO: Tune or evaluate if really need to ask for more than what's needed
+	unsigned int bufs_available = xsk_prod_nb_free(&xsk->tx, TX_RING_SIZE / 4);
+#if HANDLE_RETRIES
+	// TODO: Evaluate: Workaround that maybe only works by adding delay.
+	// Theory is that kicking the driver may have some effect since our tx ring is never
+	// full, perhaps something in the driver is.
+	if (bufs_available < (TX_RING_SIZE / 16) &&
+		xsk_ring_prod__needs_wakeup(&xsk->tx)) {
 		// Kick tx, in case it is stuck
 		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 		extra_tx_kick++;
 	}
-	if (needed < COPY_LIST_LEN) {
-		if (retries_remaining > 0) {
-			retries_remaining--;
-
+	// Retry mechanism
+	if (bufs_available < COPY_LIST_LEN) {
+		if (retries_remaining-- > 0) {
 			// Recycle completion list
-			complete_tx(xsk);
+			recycle_tx_completion(xsk);
 			recycle_retries++;
 			goto retry_reserve;
 		}
 	}
-	if (needed < COPY_LIST_LEN) {
-		/* No more transmit slots, drop the packet */
-		//printf("Dropping, no more slots\n");
+#endif
+
+	// TODO: This does all-or-nothing, could instead start
+	// dropping secondary addresses, but always send to primary
+	// if there is at least one tx descriptor available.
+	if (bufs_available < COPY_LIST_LEN) {
+		/* Not enough transmit slots, drop the packet */
 		dropped_no_slots++;
 		return false;
 	}
+
+	unsigned int needed = bufs_available;
 	if (needed > COPY_LIST_LEN) {
 		needed = COPY_LIST_LEN;
 	}
+
 	total_needed += needed;
+
+	// Start parsing the packet
 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 	struct ethhdr *eth = (struct ethhdr *) pkt;
 	struct iphdr *ip = (struct iphdr *) (eth + 1);
@@ -456,20 +430,20 @@ retry_reserve:
 	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
 	memcpy(eth->h_source, tmp_mac, ETH_ALEN);
 
-	// Swap IP addresses (neutral to checksumming) so we have correct source IP; dest will be overwritten.
+	// Swap IP addresses (neutral to checksumming) so we have correct source IP
+	// We need to update the dest address (even though we know we are going to
+	// overwrite,) so that the incremental checksum update will work.
 	in_addr_t temp = ip->saddr;	// network byte order, do not care
 	ip->saddr = ip->daddr;
 	ip->daddr = temp;
 
-#if 0
-	int retry_count = 0;
-reallocate:
-#endif
-	// Allocate all the frames first
-	unsigned int allocated = 0;
+	// Allocate all the frames first, so we're sure we've got them all.
+	// (TODO: Do we need to?  Seems like maybe this could be combined with below loop)
+	unsigned int frames_allocated = 0;
 	uint64_t frames[COPY_LIST_LEN];
 	for (int i = 0; i < needed; i++) {
 		if (i == 0) {
+			// First one is the original Rx frame, not allocated here.
 			frames[i] = addr;
 		} else {
 			frames[i] = xsk_alloc_umem_frame(xsk);
@@ -477,29 +451,20 @@ reallocate:
 				break;
 			}
 		}
-		allocated++;
+		frames_allocated++;
 	}
-	total_allocs += allocated;
-	//printf("multicopy packet: allocated=%d\n", allocated);
-#if 0
-	if (allocated == 0) {
-		if (retry_count++ < 2) {
-			complete_tx(xsk);
-			goto reallocate;
-		}
-		printf("FAILED TO ALLOCATE\n");
-		return false;
-	}
-#endif
+	total_allocs += frames_allocated;
+
 	// Copy and fixup each copy's IP/UDP port
 	mcopy *m = copy_list;
-	for (int i = 0; i < allocated; i++, m++) {
+	for (int i = 0; i < frames_allocated; i++, m++) {
 		uint8_t *pkt_copy = xsk_umem__get_data(xsk->umem->buffer, frames[i]);
-		// First packet is the original one.
+		// If this is not the first frame, copy the data from the first frame
 		if (i > 0) {
 			memcpy(pkt_copy, pkt, len);
 		}
-#if 1 // This is simple now, but if vlan headers or ip6 support is needed, then better to use offsets into copy
+#if 1 	// This is simple now, but if vlan headers or ip6 support is needed,
+		// then better to use offset from start of packet data to avoid conditionals/reparsing.
 		struct ethhdr *eth_copy = (struct ethhdr *) pkt_copy;
 		struct iphdr *ip_copy = (struct iphdr *) (eth_copy + 1);
 		struct udphdr *udp_copy = (struct udphdr*) (ip_copy + 1);
@@ -510,22 +475,26 @@ reallocate:
 		replace_ip_addr_and_port(ip_copy, udp_copy, m->new_addr, m->new_port);
 	}
 
-	// Reserve
+	// Reserve Tx ring descriptors so we can start filling them out
 	uint32_t tx_idx = 0;
-	unsigned int reserved = xsk_ring_prod__reserve(&xsk->tx, allocated, &tx_idx);
-	if (reserved < allocated) {
-		printf("Reserved less than allocation!\n");
+	unsigned int reserved = xsk_ring_prod__reserve(&xsk->tx, frames_allocated, &tx_idx);
+	if (reserved < frames_allocated) {
+		// This is unexpected because we've already verified number of available ring descriptors
+		// TODO: ratelimit printout, or convert to stat counter.
+		printf("Reserved less than frames_allocated!\n");
 	}
-	// submit
-	for (int i = 0; i < allocated; i++, tx_idx++) {
+
+	// Fill out descriptors and submit
+	for (int i = 0; i < frames_allocated; i++, tx_idx++) {
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = frames[i];
 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
 	}
-	xsk_ring_prod__submit(&xsk->tx, allocated);
-	xsk->outstanding_tx += allocated;
+	xsk_ring_prod__submit(&xsk->tx, frames_allocated);
 
-	xsk->stats.tx_bytes += len * allocated;
-	xsk->stats.tx_packets += allocated;
+	xsk->outstanding_tx += frames_allocated;
+
+	xsk->stats.tx_bytes += len * frames_allocated;
+	xsk->stats.tx_packets += frames_allocated;
 
 	if (xsk_ring_prod__needs_wakeup(&xsk->tx)) {
 		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
@@ -543,6 +512,9 @@ static bool process_packet(struct xsk_socket_info *xsk,
 #define UPPER_PORT 8011
 #define LOWER_PORT 8007
 
+	// eBPF has already checked this when it decided to send to this xsk.
+	// However, it might have not been the exact same check (e.g. did it
+	// allow IPv6 or VLAN?)  So, it is good to double check here.
 	if (ntohs(eth->h_proto) != ETH_P_IP ||
 		len < (sizeof(*eth) + sizeof(*ip) + sizeof(*udp)) ||
 		// TODO: Should validate IPv4 IHL and skip if there are any options present
@@ -551,131 +523,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		return false;
 	}
 	return multicopy_packet(xsk, addr, len);
-// DEAD CODE NOW:
-
-//	printf("process_packet() handling ip.id=%hu, addr=%" PRIx64 "\n", ip->id, addr);
-	if (is_initial_rx) {
-		// Swap MAC addresses, to send right back
-		uint8_t tmp_mac[ETH_ALEN];
-		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-	}
-
-	uint32_t csum;
-#define SIMPLE_SWAP 0
-#if SIMPLE_SWAP
-	// Simple swap of ip src/dst, should not need checksum adjustment.
-	in_addr_t temp = ip->saddr;	// network byte order, do not care
-	ip->saddr = ip->daddr;
-	ip->daddr = temp;
-#else
-	in_addr_t new_ip = 0xc0a80038;	// 192.168.0.56
-	in_addr_t old_ip = ntohl(ip->daddr);
-	if (is_initial_rx) {
-		// Replace IP address
-		ip->daddr = htonl(new_ip);
-		// Fix the checksum in IP header
-		csum = ~ntohs(ip->check);
-		csum -= old_ip;
-		csum += new_ip;
-		csum = (csum & 0xffff) + (csum >> 16);
-		csum = (csum & 0xffff) + (csum >> 16);
-		ip->check = ~htons(csum);
-	}
-#endif
-
-
-	// Fix the checksum in UDP header
-	csum = ~ntohs(udp->check);
-//	printf("portIn = %d\n", ntohs(udp->dest));
-#if !SIMPLE_SWAP
-	if (is_initial_rx) {
-		csum -= old_ip;
-		csum += new_ip;
-	}
-#endif
-#if 1 // Increment port
-	uint16_t old_port = ntohs(udp->dest);
-	uint16_t new_port = (old_port + 1) & 0xFFFF;
-	csum -= old_port;
-	csum += new_port;
-	udp->dest = htons(new_port);
-#endif
-	csum = (csum & 0xffff) + (csum >> 16);
-	csum = (csum & 0xffff) + (csum >> 16);
-	udp->check = ~htons(csum);
-//	printf("portOut= %d\n", ntohs(udp->dest));
-
-	duplicate_and_process_packet(xsk, addr, len);
-	/* Here we sent the packet out of the receive port. Note that
-		* we allocate one entry and schedule it. Your design would be
-		* faster if you do batch processing/transmission */
-
-
-	bool ret = transmit_packet(xsk, addr, len);
-	//complete_tx(xsk);
-	return ret;
-#if 0 // MSF: Original function:
-    /* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
-	 *
-	 * Some assumptions to make it easier:
-	 * - No VLAN handling
-	 * - Only if nexthdr is ICMP
-	 * - Just return all data with MAC/IP swapped, and type set to
-	 *   ICMPV6_ECHO_REPLY
-	 * - Recalculate the icmp checksum */
-
-	if (false) {
-		int ret;
-		uint32_t tx_idx = 0;
-		uint8_t tmp_mac[ETH_ALEN];
-		struct in6_addr tmp_ip;
-		struct ethhdr *eth = (struct ethhdr *) pkt;
-		struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-		struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
-
-		if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-		    len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-		    ipv6->nexthdr != IPPROTO_ICMPV6 ||
-		    icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-			return false;
-
-		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-		memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-		memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-		memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
-
-		icmp->icmp6_type = ICMPV6_ECHO_REPLY;
-
-		csum_replace2(&icmp->icmp6_cksum,
-			      htons(ICMPV6_ECHO_REQUEST << 8),
-			      htons(ICMPV6_ECHO_REPLY << 8));
-
-		/* Here we sent the packet out of the receive port. Note that
-		 * we allocate one entry and schedule it. Your design would be
-		 * faster if you do batch processing/transmission */
-
-		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-		if (ret != 1) {
-			/* No more transmit slots, drop the packet */
-			return false;
-		}
-
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-		xsk_ring_prod__submit(&xsk->tx, 1);
-		xsk->outstanding_tx++;
-
-		xsk->stats.tx_bytes += len;
-		xsk->stats.tx_packets++;
-		return true;
-	}
-	return false;
-#endif
 }
 
 void stuff_fill_ring(struct xsk_socket_info *xsk) {
@@ -690,14 +537,10 @@ void stuff_fill_ring(struct xsk_socket_info *xsk) {
 		stock_frames = xsk_ring_prod__reserve(&xsk->umem->fq, stock_frames,
 					     &idx_fq);
 
-		/* This should not happen, but just in case */
-//		while (ret != stock_frames)
-//			ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd,
-//						     &idx_fq);
-
 		for (i = 0; i < stock_frames; i++) {
 			uint64_t frame = xsk_alloc_umem_frame(xsk);
 			if (frame == INVALID_UMEM_FRAME) {
+				// TODO: Convert to stat or rate limit printout (I didn't see this happen.)
 				printf("INVALID FRAME put into fill queue\n");
 			}
 			*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = frame;
@@ -739,8 +582,6 @@ static unsigned int handle_receive_packets(struct xsk_socket_info *xsk)
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	xsk->stats.rx_packets += rcvd;
 
-	//stuff_fill_ring(xsk);
-
 	return rcvd;
   }
 
@@ -755,23 +596,15 @@ static void rx_and_process(struct config *cfg,
 	fds[0].events = POLLIN;
 
 	while(!global_exit) {
-//		usleep(10);
-		//if (cfg->xsk_poll_mode && !xsk_socket->outstanding_tx) { // MSF
 		if (cfg->xsk_poll_mode) {
 			ret = poll(fds, nfds, -1);
 			if (ret <= 0 || ret > 1)
 				continue;
 		}
-#if 1
+		// Keep it going until we have no more Rx packets
 		while (!global_exit && handle_receive_packets(xsk_socket)) {
-			/* Do we need to wake up the kernel for transmission */
-			complete_tx(xsk_socket);
+			recycle_tx_completion(xsk_socket);
 		}
-	//	complete_tx(xsk_socket);
-#else
-		handle_receive_packets(xsk_socket)) {
-		complete_tx(xsk_socket);
-#endif
 	}
 }
 
@@ -838,8 +671,8 @@ static void stats_print(struct stats_record *stats_rec,
 	       stats_rec->tx_bytes / 1000 , bps,
 	       period);
 	printf("  Total completed: %lu, dropped_no_slots=%lu, total_needed=%lu, total_allocs=%lu\n", total_completed, dropped_no_slots, total_needed, total_allocs);
-	printf("  lastRxbatchsize: %lu, max_batch_size=%lu, maxcompleted:%lu\n", last_batch_size, max_batch_size, max_completed);
-	printf("  rx:tx ratio:  1:%1.4f, recycle_retries=%lu, extra_tx_kick=%lu\n", tx_pps/rx_pps, recycle_retries, extra_tx_kick);
+	printf("  lastRxbatchsize: %lu, max_batch_size: %lu, maxcompleted: %lu, lastcompleted: %lu\n", last_batch_size, max_batch_size, max_completed, last_completed);
+	printf("  rx:tx ratio:  1:%1.4f, recycle_retries: %lu, extra_tx_kick: %lu\n", tx_pps/rx_pps, recycle_retries, extra_tx_kick);
 	max_batch_size = 0;
 	max_completed = 0;
 	printf("\n");
