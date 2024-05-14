@@ -28,21 +28,29 @@
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
 #include <linux/udp.h>
+#include <netinet/in.h>
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
 
-#define NUM_FRAMES         4096
+#define FRAME_SCALE_FACTOR 2
+#define TX_RING_SCALE_FACTOR 1
+#define BATCH_SCALE_FACTOR 1
+
+#define NUM_FRAMES         (FRAME_SCALE_FACTOR * 4096)
 #define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
-#define RX_BATCH_SIZE      64
+#define RX_BATCH_SIZE      (BATCH_SCALE_FACTOR * 64)
 #define INVALID_UMEM_FRAME UINT64_MAX
+
+#define TX_RING_SIZE (TX_RING_SCALE_FACTOR * XSK_RING_PROD__DEFAULT_NUM_DESCS)
 
 static struct xdp_program *prog;
 int xsk_map_fd;
 bool custom_xsk = false;
 struct config cfg = {
 	.ifindex   = -1,
+	.xsk_bind_flags = XDP_USE_NEED_WAKEUP,
 };
 
 struct xsk_umem_info {
@@ -73,14 +81,17 @@ struct xsk_socket_info {
 	struct stats_record prev_stats;
 };
 
-struct tx_packet_info {
-	uint16_t len;
-};
-
-struct tx_packet_info tx_len[XSK_RING_CONS__DEFAULT_NUM_DESCS];
-
 static bool process_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len, bool is_initial_rx);
 
+uint64_t total_completed = 0;
+uint64_t dropped_no_slots = 0;
+uint64_t total_needed = 0;
+uint64_t total_allocs = 0;
+uint64_t last_batch_size = 0;
+uint64_t max_batch_size = 0;
+uint64_t max_completed = 0;
+uint64_t recycle_retries = 0;
+uint64_t extra_tx_kick = 0;
 
 static inline __u32 xsk_ring_prod__free(struct xsk_ring_prod *r)
 {
@@ -195,7 +206,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 
 	xsk_info->umem = umem;
 	xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
-	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+	xsk_cfg.tx_size = TX_RING_SIZE;
 	xsk_cfg.xdp_flags = cfg->xdp_flags;
 	xsk_cfg.bind_flags = cfg->xsk_bind_flags;
 	xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD: 0;
@@ -248,11 +259,18 @@ static void complete_tx(struct xsk_socket_info *xsk)
 	unsigned int completed;
 	uint32_t idx_cq;
 
-	if (!xsk->outstanding_tx)
+#if 0
+	if (!xsk->outstanding_tx) {
+	//	printf("No outstanding\n");
 		return;
-
-	sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-
+	}
+#endif
+#if 0 // Moved to where we submit descriptors
+	if (xsk_ring_prod__needs_wakeup(&xsk->tx)) {
+		printf("Sendto");
+		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	}
+#endif
 	/* Collect/free completed TX buffers */
 	completed = xsk_ring_cons__peek(&xsk->umem->cq,
 					XSK_RING_CONS__DEFAULT_NUM_DESCS,
@@ -260,10 +278,15 @@ static void complete_tx(struct xsk_socket_info *xsk)
 
 	if (completed > 0) {
 #if 1
-        for (int i = 0; i < completed; i++)
+        for (int i = 0; i < completed; i++) {
 			xsk_free_umem_frame(xsk,
 				*xsk_ring_cons__comp_addr(&xsk->umem->cq,
 										  idx_cq++));
+		}
+		total_completed += completed;
+		if (max_completed < completed) {
+			max_completed = completed;
+		}
 #else
 		int newly_sent = 0;
 		for (int i = 0; i < completed; i++) {
@@ -340,6 +363,176 @@ static void duplicate_and_process_packet(struct xsk_socket_info *xsk, uint64_t a
 	} // else: Packet was transmitted inside process_packet.
 }
 
+typedef struct mcopy {
+	in_addr_t  new_addr;
+	uint16_t new_port;
+} mcopy;
+
+#define NEW_IP 0xc0a80038 // 192.168.0.56
+mcopy copy_list[] = {
+		{NEW_IP, 8008},
+		{NEW_IP, 8009},
+		{NEW_IP, 8010},
+		{NEW_IP, 8011},
+		{NEW_IP, 8012}
+		};
+#define COPY_LIST_LEN (sizeof(copy_list) / sizeof(copy_list[0]))
+
+static void replace_ip_addr_and_port(struct iphdr *ip, struct udphdr *udp, in_addr_t new_addr, uint16_t new_port) {
+	in_addr_t old_addr = ntohl(ip->daddr);
+	// Replace IP address
+	ip->daddr = htonl(new_addr);
+	// Fix the checksum in IP header
+	uint32_t csum;
+	csum = ~ntohs(ip->check);
+	csum -= old_addr;
+	csum += new_addr;
+	csum = (csum & 0xffff) + (csum >> 16);
+	csum = (csum & 0xffff) + (csum >> 16);
+	ip->check = ~htons(csum);
+
+	// Fix the checksum in UDP header, including psuedo-header which covers address in IP header
+	// If it's zero, then checksumming was skipped, so don't touch it.
+	if (udp->check != 0) {
+		csum = ~ntohs(udp->check);
+		csum -= old_addr;
+		csum += new_addr;
+		if (new_port != 0) {
+			uint16_t old_port = ntohs(udp->dest);
+			csum -= old_port;
+			csum += new_port;
+			udp->dest = htons(new_port);
+		}
+		csum = (csum & 0xffff) + (csum >> 16);
+		csum = (csum & 0xffff) + (csum >> 16);
+		udp->check = ~htons(csum);
+	} else {
+		if (new_port != 0) {
+			udp->dest = htons(new_port);
+		}
+	}
+}
+
+static bool multicopy_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
+{
+	unsigned int retries_remaining = 10000;
+
+retry_reserve:
+	// First, see if there are enough tx descriptors to make all copies
+	unsigned int needed = xsk_prod_nb_free(&xsk->tx, TX_RING_SIZE / 4);
+	//printf("needed: %d", needed);
+	if (needed < (TX_RING_SIZE / 8)) {
+		// Kick tx, in case it is stuck
+		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+		extra_tx_kick++;
+	}
+	if (needed < COPY_LIST_LEN) {
+		if (retries_remaining > 0) {
+			retries_remaining--;
+
+			// Recycle completion list
+			complete_tx(xsk);
+			recycle_retries++;
+			goto retry_reserve;
+		}
+	}
+	if (needed < COPY_LIST_LEN) {
+		/* No more transmit slots, drop the packet */
+		//printf("Dropping, no more slots\n");
+		dropped_no_slots++;
+		return false;
+	}
+	if (needed > COPY_LIST_LEN) {
+		needed = COPY_LIST_LEN;
+	}
+	total_needed += needed;
+	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+	struct ethhdr *eth = (struct ethhdr *) pkt;
+	struct iphdr *ip = (struct iphdr *) (eth + 1);
+
+	// Swap MAC addresses, to send right back
+	uint8_t tmp_mac[ETH_ALEN];
+	memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+	memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+	// Swap IP addresses (neutral to checksumming) so we have correct source IP; dest will be overwritten.
+	in_addr_t temp = ip->saddr;	// network byte order, do not care
+	ip->saddr = ip->daddr;
+	ip->daddr = temp;
+
+#if 0
+	int retry_count = 0;
+reallocate:
+#endif
+	// Allocate all the frames first
+	unsigned int allocated = 0;
+	uint64_t frames[COPY_LIST_LEN];
+	for (int i = 0; i < needed; i++) {
+		if (i == 0) {
+			frames[i] = addr;
+		} else {
+			frames[i] = xsk_alloc_umem_frame(xsk);
+			if (frames[i] == INVALID_UMEM_FRAME) {
+				break;
+			}
+		}
+		allocated++;
+	}
+	total_allocs += allocated;
+	//printf("multicopy packet: allocated=%d\n", allocated);
+#if 0
+	if (allocated == 0) {
+		if (retry_count++ < 2) {
+			complete_tx(xsk);
+			goto reallocate;
+		}
+		printf("FAILED TO ALLOCATE\n");
+		return false;
+	}
+#endif
+	// Copy and fixup each copy's IP/UDP port
+	mcopy *m = copy_list;
+	for (int i = 0; i < allocated; i++, m++) {
+		uint8_t *pkt_copy = xsk_umem__get_data(xsk->umem->buffer, frames[i]);
+		// First packet is the original one.
+		if (i > 0) {
+			memcpy(pkt_copy, pkt, len);
+		}
+#if 1 // This is simple now, but if vlan headers or ip6 support is needed, then better to use offsets into copy
+		struct ethhdr *eth_copy = (struct ethhdr *) pkt_copy;
+		struct iphdr *ip_copy = (struct iphdr *) (eth_copy + 1);
+		struct udphdr *udp_copy = (struct udphdr*) (ip_copy + 1);
+#else
+		struct iphdr *ip_copy = (struct iphdr*)(pkt_copy + ((uint8_t*)ip - pkt));
+		struct udphdr *udp_copy = (struct udphdr*)(pkt_copy + ((uint8_t*)udp - pkt));
+#endif
+		replace_ip_addr_and_port(ip_copy, udp_copy, m->new_addr, m->new_port);
+	}
+
+	// Reserve
+	uint32_t tx_idx = 0;
+	unsigned int reserved = xsk_ring_prod__reserve(&xsk->tx, allocated, &tx_idx);
+	if (reserved < allocated) {
+		printf("Reserved less than allocation!\n");
+	}
+	// submit
+	for (int i = 0; i < allocated; i++, tx_idx++) {
+		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = frames[i];
+		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
+	}
+	xsk_ring_prod__submit(&xsk->tx, allocated);
+	xsk->outstanding_tx += allocated;
+
+	xsk->stats.tx_bytes += len * allocated;
+	xsk->stats.tx_packets += allocated;
+
+	if (xsk_ring_prod__needs_wakeup(&xsk->tx)) {
+		sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	}
+	return true;
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len, bool is_initial_rx)
 {
@@ -352,10 +545,14 @@ static bool process_packet(struct xsk_socket_info *xsk,
 
 	if (ntohs(eth->h_proto) != ETH_P_IP ||
 		len < (sizeof(*eth) + sizeof(*ip) + sizeof(*udp)) ||
+		// TODO: Should validate IPv4 IHL and skip if there are any options present
 		ntohs(udp->dest) > UPPER_PORT || ntohs(udp->dest) < LOWER_PORT)
 	{
 		return false;
 	}
+	return multicopy_packet(xsk, addr, len);
+// DEAD CODE NOW:
+
 //	printf("process_packet() handling ip.id=%hu, addr=%" PRIx64 "\n", ip->id, addr);
 	if (is_initial_rx) {
 		// Swap MAC addresses, to send right back
@@ -481,36 +678,50 @@ static bool process_packet(struct xsk_socket_info *xsk,
 #endif
 }
 
-static void handle_receive_packets(struct xsk_socket_info *xsk)
-{
-	unsigned int rcvd, stock_frames, i;
-	uint32_t idx_rx = 0, idx_fq = 0;
-	int ret;
-
-	rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
-	if (!rcvd)
-		return;
-
+void stuff_fill_ring(struct xsk_socket_info *xsk) {
+	unsigned int stock_frames, i;
+	uint32_t idx_fq = 0;
 	/* Stuff the ring with as much frames as possible */
 	stock_frames = xsk_prod_nb_free(&xsk->umem->fq,
 					xsk_umem_free_frames(xsk));
 
 	if (stock_frames > 0) {
 
-		ret = xsk_ring_prod__reserve(&xsk->umem->fq, stock_frames,
+		stock_frames = xsk_ring_prod__reserve(&xsk->umem->fq, stock_frames,
 					     &idx_fq);
 
 		/* This should not happen, but just in case */
-		while (ret != stock_frames)
-			ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd,
-						     &idx_fq);
+//		while (ret != stock_frames)
+//			ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd,
+//						     &idx_fq);
 
-		for (i = 0; i < stock_frames; i++)
-			*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
-				xsk_alloc_umem_frame(xsk);
+		for (i = 0; i < stock_frames; i++) {
+			uint64_t frame = xsk_alloc_umem_frame(xsk);
+			if (frame == INVALID_UMEM_FRAME) {
+				printf("INVALID FRAME put into fill queue\n");
+			}
+			*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = frame;
+		}
 
 		xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
 	}
+}
+
+static unsigned int handle_receive_packets(struct xsk_socket_info *xsk)
+{
+	unsigned int rcvd, i;
+	uint32_t idx_rx = 0;
+
+	rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
+	if (!rcvd)
+		return 0;
+
+	last_batch_size = rcvd;
+	if (max_batch_size < rcvd) {
+		max_batch_size = rcvd;
+	}
+
+	stuff_fill_ring(xsk);
 
 	/* Process received packets */
 	for (i = 0; i < rcvd; i++) {
@@ -527,6 +738,10 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	xsk->stats.rx_packets += rcvd;
+
+	//stuff_fill_ring(xsk);
+
+	return rcvd;
   }
 
 static void rx_and_process(struct config *cfg,
@@ -547,9 +762,16 @@ static void rx_and_process(struct config *cfg,
 			if (ret <= 0 || ret > 1)
 				continue;
 		}
-		handle_receive_packets(xsk_socket);
-		/* Do we need to wake up the kernel for transmission */
+#if 1
+		while (!global_exit && handle_receive_packets(xsk_socket)) {
+			/* Do we need to wake up the kernel for transmission */
+			complete_tx(xsk_socket);
+		}
+	//	complete_tx(xsk_socket);
+#else
+		handle_receive_packets(xsk_socket)) {
 		complete_tx(xsk_socket);
+#endif
 	}
 }
 
@@ -584,7 +806,8 @@ static void stats_print(struct stats_record *stats_rec,
 {
 	uint64_t packets, bytes;
 	double period;
-	double pps; /* packets per sec */
+	double rx_pps; /* packets per sec */
+	double tx_pps; /* packets per sec */
 	double bps; /* bits per sec */
 
 	char *fmt = "%-12s %'11lld pkts (%'10.0f pps)"
@@ -596,25 +819,29 @@ static void stats_print(struct stats_record *stats_rec,
 		period = 1;
 
 	packets = stats_rec->rx_packets - stats_prev->rx_packets;
-	pps     = packets / period;
+	rx_pps  = packets / period;
 
 	bytes   = stats_rec->rx_bytes   - stats_prev->rx_bytes;
 	bps     = (bytes * 8) / period / 1000000;
 
-	printf(fmt, "AF_XDP RX:", stats_rec->rx_packets, pps,
+	printf(fmt, "AF_XDP RX:", stats_rec->rx_packets, rx_pps,
 	       stats_rec->rx_bytes / 1000 , bps,
 	       period);
 
 	packets = stats_rec->tx_packets - stats_prev->tx_packets;
-	pps     = packets / period;
+	tx_pps  = packets / period;
 
 	bytes   = stats_rec->tx_bytes   - stats_prev->tx_bytes;
 	bps     = (bytes * 8) / period / 1000000;
 
-	printf(fmt, "       TX:", stats_rec->tx_packets, pps,
+	printf(fmt, "       TX:", stats_rec->tx_packets, tx_pps,
 	       stats_rec->tx_bytes / 1000 , bps,
 	       period);
-
+	printf("  Total completed: %lu, dropped_no_slots=%lu, total_needed=%lu, total_allocs=%lu\n", total_completed, dropped_no_slots, total_needed, total_allocs);
+	printf("  lastRxbatchsize: %lu, max_batch_size=%lu, maxcompleted:%lu\n", last_batch_size, max_batch_size, max_completed);
+	printf("  rx:tx ratio:  1:%1.4f, recycle_retries=%lu, extra_tx_kick=%lu\n", tx_pps/rx_pps, recycle_retries, extra_tx_kick);
+	max_batch_size = 0;
+	max_completed = 0;
 	printf("\n");
 }
 
