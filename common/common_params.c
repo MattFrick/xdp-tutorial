@@ -97,7 +97,7 @@ void parse_cmdline_args(int argc, char **argv,
 	}
 
 	/* Parse commands line args */
-	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFU:MQ:czpqm:",
+	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFU:MQ:czpqm:u:",
 				  long_options, &longindex)) != -1) {
 		switch (opt) {
 		case 'd':
@@ -193,7 +193,7 @@ void parse_cmdline_args(int argc, char **argv,
 				mcopy m = { .new_addr.s_addr = 0, .new_port = 0 };
 				char *port = strstr(optarg, ":");
 				if (port != NULL) {
-					*port = 0;
+					*port = 0; // Overwrite delim with NUL term.
 					port++;
 					m.new_port = (uint16_t) strtol(port, NULL, 10);
 				}
@@ -206,6 +206,35 @@ void parse_cmdline_args(int argc, char **argv,
 				cfg->copy_list.length++;
 				cfg->copy_list.list = realloc(cfg->copy_list.list, cfg->copy_list.length * sizeof(cfg->copy_list.list[0]));
 				cfg->copy_list.list[cfg->copy_list.length-1] = m;
+			}
+			break;
+		case 'u':
+			{
+				printf("Found udp port (range) option: %s\n", optarg);
+				char *end_port_str = strstr(optarg, "-");
+				uint16_t end_port = 0, port;
+				if (end_port_str != NULL) {
+					*end_port_str = 0; // Overwrite delim with NUL term.
+					end_port_str++;
+					end_port = (uint16_t) strtol(end_port_str, NULL, 10);
+				}
+				port = (uint16_t) strtol(optarg, NULL, 10);
+				if (port == 0) {
+					fprintf(stderr, "ERR: zero port");
+					goto error;
+				}
+				if (end_port && end_port < port) {
+					fprintf(stderr, "ERR: port range out of order (%d < %d)", port, end_port);
+					goto error;
+				}
+				printf("UDP port arg: %hu, UDP end port arg: %hu", port, end_port);
+				// If end port is not set, do one port.  Otherwise, use range.
+				for (uint16_t p = port; p <= end_port || p == port; p++) {
+					printf("Adding UDP port %hu\n", p);
+					cfg->port_list.length++;
+					cfg->port_list.ports = realloc(cfg->port_list.ports, cfg->port_list.length * sizeof(cfg->port_list.ports[0]));
+					cfg->port_list.ports[cfg->port_list.length-1] = p;
+				}
 			}
 			break;
 		case 'h':

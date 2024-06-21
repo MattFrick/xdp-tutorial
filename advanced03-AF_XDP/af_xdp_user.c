@@ -148,6 +148,9 @@ static const struct option_wrapper long_options[] = {
 	{{"mcopy", required_argument, NULL, 'm'},
 	 "\"Multipacket\" copy to <ip>[:port]"},
 
+	{{"udp-port", required_argument, NULL, 'u'},
+	 "Allow UDP port[s] to redirect into xsk.  <port>[-<port_range_end>]"},
+
 	{{0, 0, NULL,  0 }, NULL, false}
 };
 
@@ -737,6 +740,12 @@ int main(int argc, char **argv)
 		for (int i = 0; i < cfg.copy_list.length; i++) {
 			mcopy *pm = &cfg.copy_list.list[i];
 			printf("%d. 0x%x:%hu\n", i, (uint32_t)pm->new_addr.s_addr, pm->new_port);
+		}
+	}
+	if (cfg.port_list.length > 0) {
+		printf("UDP ports (%d):\n", cfg.port_list.length);
+		for (int i = 0; i < cfg.port_list.length; i++) {
+			printf("%d. %hu\n", i + 1, cfg.port_list.ports[i]);
 		}
 	}
 

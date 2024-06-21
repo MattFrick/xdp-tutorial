@@ -19,6 +19,11 @@ typedef struct mcopy_list {
 	struct mcopy *list;
 } mcopy_list;
 
+typedef struct port_list {
+	uint32_t	length;
+	uint16_t	*ports;
+} port_list;
+
 struct config {
 	enum xdp_attach_mode attach_mode;
 	__u32 xdp_flags;
@@ -41,6 +46,7 @@ struct config {
 	bool xsk_poll_mode;
 	bool unload_all;
 	mcopy_list copy_list; // Multipacket copy
+	port_list port_list;
 };
 
 /* Defined in common_params.o */
