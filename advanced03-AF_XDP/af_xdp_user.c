@@ -50,6 +50,7 @@
 
 static struct xdp_program *prog;
 int xsk_map_fd;
+int intercept_map_fd;
 bool custom_xsk = false;
 struct config cfg = {
 	.ifindex   = -1,
@@ -743,7 +744,7 @@ int main(int argc, char **argv)
 		}
 	}
 	if (cfg.port_list.length > 0) {
-		printf("UDP ports (%d):\n", cfg.port_list.length);
+		printf("Input UDP ports (%d):\n", cfg.port_list.length);
 		for (int i = 0; i < cfg.port_list.length; i++) {
 			printf("%d. %hu\n", i + 1, cfg.port_list.ports[i]);
 		}
@@ -790,6 +791,24 @@ int main(int argc, char **argv)
 			fprintf(stderr, "ERROR: no xsks map found: %s\n",
 				strerror(xsk_map_fd));
 			exit(EXIT_FAILURE);
+		}
+
+		// Multipacket copy:
+		if (cfg.port_list.length > 0) {
+			printf("Configuring map for UDP intercept ports\n");
+			map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "udp_intercept_ports");
+			intercept_map_fd = bpf_map__fd(map);
+			if (intercept_map_fd < 0) {
+				fprintf(stderr, "ERROR: no udp_intercept_ports map found: %s\n",
+					strerror(intercept_map_fd));
+				exit(EXIT_FAILURE);
+			}
+			for (int i = 0; i < cfg.port_list.length; i++) {
+				printf("%d. %hu\n", i + 1, cfg.port_list.ports[i]);
+				_Bool t = true;
+				uint16_t network_order_port = htons(cfg.port_list.ports[i]);
+				bpf_map_update_elem(intercept_map_fd, &network_order_port, &t, BPF_ANY);
+			}
 		}
 	}
 

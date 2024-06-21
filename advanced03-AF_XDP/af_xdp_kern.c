@@ -19,6 +19,13 @@ struct {
 	__uint(max_entries, 64);
 } xdp_stats_map SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u16);
+	__type(value, _Bool);
+	__uint(max_entries, 64);
+} udp_intercept_ports SEC(".maps");
+
 SEC("xdp")
 int xdp_sock_prog(struct xdp_md *ctx)
 {
@@ -50,14 +57,18 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	}
 
 	if (ip_type == IPPROTO_UDP) {
-#define UPPER_PORT 8020
-#define LOWER_PORT 8007
 
 		if (parse_udphdr(&nh, data_end, &udphdr) < 0) {
 			goto out;
 		}
+#if 0
+#define UPPER_PORT 8020
+#define LOWER_PORT 8007
 		if (ntohs(udphdr->dest) >= LOWER_PORT &&
             ntohs(udphdr->dest) <= UPPER_PORT)
+#else
+		if (NULL != bpf_map_lookup_elem(&udp_intercept_ports, &udphdr->dest))
+#endif
         {
 			/* A set entry here means that the correspnding queue_id
 			* has an active AF_XDP socket bound to it. */
