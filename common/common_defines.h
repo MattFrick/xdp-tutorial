@@ -6,6 +6,19 @@
 #include <stdbool.h>
 #include <xdp/libxdp.h>
 
+// Multipacket copy:
+#include <sys/socket.h>
+#include <netinet/in.h>
+typedef struct mcopy {
+	struct in_addr  new_addr;
+	uint16_t new_port;
+} mcopy;
+
+typedef struct mcopy_list {
+	uint32_t	length;
+	struct mcopy *list;
+} mcopy_list;
+
 struct config {
 	enum xdp_attach_mode attach_mode;
 	__u32 xdp_flags;
@@ -27,6 +40,7 @@ struct config {
 	int xsk_if_queue;
 	bool xsk_poll_mode;
 	bool unload_all;
+	mcopy_list copy_list; // Multipacket copy
 };
 
 /* Defined in common_params.o */

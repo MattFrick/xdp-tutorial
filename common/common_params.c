@@ -10,6 +10,11 @@
 #include <linux/if_link.h> /* XDP_FLAGS_* depend on kernel-headers installed */
 #include <linux/if_xdp.h>
 
+// Multipacket copy:
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "common_params.h"
 
 int verbose = 1;
@@ -92,7 +97,7 @@ void parse_cmdline_args(int argc, char **argv,
 	}
 
 	/* Parse commands line args */
-	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFU:MQ:czpq",
+	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFU:MQ:czpqm:",
 				  long_options, &longindex)) != -1) {
 		switch (opt) {
 		case 'd':
@@ -181,6 +186,27 @@ void parse_cmdline_args(int argc, char **argv,
 			break;
 		case 4: /* --unload-all */
 			cfg->unload_all = true;
+			break;
+		case 'm':	// Multipacket copy:
+			//printf("Found multipacket copy arg: %s\n", optarg);
+			{
+				mcopy m = { .new_addr.s_addr = 0, .new_port = 0 };
+				char *port = strstr(optarg, ":");
+				if (port != NULL) {
+					*port = 0;
+					port++;
+					m.new_port = (uint16_t) strtol(port, NULL, 10);
+				}
+				if (!inet_aton(optarg, &m.new_addr)) {
+					fprintf(stderr,
+							"ERR: Couldn't convert string to IP address: %s (%d):%s\n",
+							optarg, errno, strerror(errno));
+					goto error;
+				}
+				cfg->copy_list.length++;
+				cfg->copy_list.list = realloc(cfg->copy_list.list, cfg->copy_list.length * sizeof(cfg->copy_list.list[0]));
+				cfg->copy_list.list[cfg->copy_list.length-1] = m;
+			}
 			break;
 		case 'h':
 			full_help = true;

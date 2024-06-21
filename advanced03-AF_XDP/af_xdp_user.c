@@ -46,6 +46,8 @@
 
 #define TX_RING_SIZE (TX_RING_SCALE_FACTOR * XSK_RING_PROD__DEFAULT_NUM_DESCS)
 
+#define COPY_LIST_LEN (cfg.copy_list.length)
+
 static struct xdp_program *prog;
 int xsk_map_fd;
 bool custom_xsk = false;
@@ -142,6 +144,9 @@ static const struct option_wrapper long_options[] = {
 
 	{{"progname",	 required_argument,	NULL,  2  },
 	 "Load program from function <name> in the ELF file", "<name>"},
+
+	{{"mcopy", required_argument, NULL, 'm'},
+	 "\"Multipacket\" copy to <ip>[:port]"},
 
 	{{0, 0, NULL,  0 }, NULL, false}
 };
@@ -318,21 +323,6 @@ bool transmit_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
 	return true;
 }
 
-typedef struct mcopy {
-	in_addr_t  new_addr;
-	uint16_t new_port;
-} mcopy;
-
-#define NEW_IP 0xc0a80038 // 192.168.0.56
-mcopy copy_list[] = {
-		{NEW_IP, 8008},
-		{NEW_IP, 8009},
-		{NEW_IP, 8010},
-		{NEW_IP, 8011},
-		{NEW_IP, 8012}
-		};
-#define COPY_LIST_LEN (sizeof(copy_list) / sizeof(copy_list[0]))
-
 static void replace_ip_addr_and_port(struct iphdr *ip, struct udphdr *udp, in_addr_t new_addr, uint16_t new_port) {
 	in_addr_t old_addr = ntohl(ip->daddr);
 	// Replace IP address
@@ -456,7 +446,7 @@ retry_reserve:
 	total_allocs += frames_allocated;
 
 	// Copy and fixup each copy's IP/UDP port
-	mcopy *m = copy_list;
+	mcopy *m = cfg.copy_list.list;
 	for (int i = 0; i < frames_allocated; i++, m++) {
 		uint8_t *pkt_copy = xsk_umem__get_data(xsk->umem->buffer, frames[i]);
 		// If this is not the first frame, copy the data from the first frame
@@ -472,7 +462,7 @@ retry_reserve:
 		struct iphdr *ip_copy = (struct iphdr*)(pkt_copy + ((uint8_t*)ip - pkt));
 		struct udphdr *udp_copy = (struct udphdr*)(pkt_copy + ((uint8_t*)udp - pkt));
 #endif
-		replace_ip_addr_and_port(ip_copy, udp_copy, m->new_addr, m->new_port);
+		replace_ip_addr_and_port(ip_copy, udp_copy, m->new_addr.s_addr, m->new_port);
 	}
 
 	// Reserve Tx ring descriptors so we can start filling them out
@@ -739,6 +729,15 @@ int main(int argc, char **argv)
 		fprintf(stderr, "ERROR: Required option --dev missing\n\n");
 		usage(argv[0], __doc__, long_options, (argc == 1));
 		return EXIT_FAIL_OPTION;
+	}
+
+	// Multipacket copy:
+	if (cfg.copy_list.length > 0) {
+		printf("Multipacket copy list:\n");
+		for (int i = 0; i < cfg.copy_list.length; i++) {
+			mcopy *pm = &cfg.copy_list.list[i];
+			printf("%d. 0x%x:%hu\n", i, (uint32_t)pm->new_addr.s_addr, pm->new_port);
+		}
 	}
 
 	/* Load custom program if configured */
