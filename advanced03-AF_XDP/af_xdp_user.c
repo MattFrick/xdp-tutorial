@@ -518,6 +518,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	if (ntohs(eth->h_proto) != ETH_P_IP ||
 		len < (sizeof(*eth) + sizeof(*ip) + sizeof(*udp)) ||
 		// TODO: Should validate IPv4 IHL and skip if there are any options present
+		ip->protocol != IPPROTO_UDP ||
 		ntohs(udp->dest) > UPPER_PORT || ntohs(udp->dest) < LOWER_PORT)
 	{
 		return false;
